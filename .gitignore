@@ -1,0 +1,66 @@
+# Build products and CMake state
+/build/
+/out/
+/cmake-build-*/
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+*.o
+*.obj
+*.d
+*.a
+
+# STM32CubeMX temporary output
+/mx.scratch/
+
+# Debug/log output
+*.log
+/gdbClient_log.txt
+/stlinkgdbserver_log.txt
+
+# Local editor/index caches
+/.cache/
+/.clangd/index/
+
+# STM32Cube local bundle resolution state
+/.settings/bundles*.store.json
+
+# Large unused CMSIS package content copied by CubeMX
+/Drivers/CMSIS/Core/
+/Drivers/CMSIS/Core_A/
+/Drivers/CMSIS/docs/
+/Drivers/CMSIS/DSP/
+/Drivers/CMSIS/NN/
+/Drivers/CMSIS/RTOS/
+/Drivers/CMSIS/RTOS2/
+/Drivers/CMSIS/Device/ST/STM32H7xx/Include/*
+!/Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h743xx.h
+!/Drivers/CMSIS/Device/ST/STM32H7xx/Include/stm32h7xx.h
+!/Drivers/CMSIS/Device/ST/STM32H7xx/Include/system_stm32h7xx.h
+/Drivers/CMSIS/Device/ST/STM32H7xx/Source/
+
+# Keep only HAL source files used by the generated CMake target.
+/Drivers/STM32H7xx_HAL_Driver/Src/*
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_cortex.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_dma.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_dma_ex.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_exti.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_flash.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_flash_ex.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_gpio.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_hsem.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_i2c.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_i2c_ex.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_mdma.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_pwr.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_pwr_ex.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_rcc.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_rcc_ex.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_tim.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_tim_ex.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_uart.c
+!/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_uart_ex.c
