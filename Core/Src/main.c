@@ -31,7 +31,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define AUDIO_FRAMES     256
+#define AUDIO_CHANNELS   2
+#define AUDIO_SAMPLES    (AUDIO_FRAMES * AUDIO_CHANNELS)
+#define PI_F             3.14159265358979323846f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -41,23 +44,43 @@
 
 /* Private variables ---------------------------------------------------------*/
 
+SAI_HandleTypeDef hsai_BlockA1;
+DMA_HandleTypeDef hdma_sai1_a;
+
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-
+__attribute__((section(".RAM_D2"), aligned(32)))
+static int16_t g_audioBuffer[AUDIO_SAMPLES];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_SAI1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void FillSineBuffer(void)
+{
+    const float amplitude = 1000.0f;
+    const float cyclesPerBuffer = 0.1f;
 
+    for (uint32_t i = 0; i < AUDIO_FRAMES; ++i)
+    {
+        float phase = 2.0f * PI_F * cyclesPerBuffer * ((float)i / (float)AUDIO_FRAMES);
+        int16_t sample = (int16_t)(sinf(phase) * amplitude);
+
+        /* Interleaved stereo: L, R, L, R, ... */
+        g_audioBuffer[i * 2 + 0] = sample;
+        g_audioBuffer[i * 2 + 1] = sample;
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -89,11 +112,28 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART1_UART_Init();
+  MX_SAI1_Init();
   /* USER CODE BEGIN 2 */
 
   HAL_UART_Transmit(&huart1, (uint8_t *)"Hello World!\r\n", 14, HAL_MAX_DELAY);
 
+  FillSineBuffer();
+
+  HAL_StatusTypeDef st;
+
+  st = HAL_SAI_InitProtocol(&hsai_BlockA1, SAI_I2S_STANDARD, SAI_PROTOCOL_DATASIZE_16BIT, 2);
+  if (st != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  st = HAL_SAI_Transmit_DMA(&hsai_BlockA1, (uint8_t*)g_audioBuffer, AUDIO_SAMPLES);
+  if (st != HAL_OK)
+  {
+      Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -166,6 +206,43 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief SAI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SAI1_Init(void)
+{
+
+  /* USER CODE BEGIN SAI1_Init 0 */
+
+  /* USER CODE END SAI1_Init 0 */
+
+  /* USER CODE BEGIN SAI1_Init 1 */
+
+  /* USER CODE END SAI1_Init 1 */
+  hsai_BlockA1.Instance = SAI1_Block_A;
+  hsai_BlockA1.Init.AudioMode = SAI_MODEMASTER_TX;
+  hsai_BlockA1.Init.Synchro = SAI_ASYNCHRONOUS;
+  hsai_BlockA1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
+  hsai_BlockA1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
+  hsai_BlockA1.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
+  hsai_BlockA1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
+  hsai_BlockA1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_48K;
+  hsai_BlockA1.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
+  hsai_BlockA1.Init.MonoStereoMode = SAI_STEREOMODE;
+  hsai_BlockA1.Init.CompandingMode = SAI_NOCOMPANDING;
+  hsai_BlockA1.Init.TriState = SAI_OUTPUT_NOTRELEASED;
+  if (HAL_SAI_InitProtocol(&hsai_BlockA1, SAI_I2S_STANDARD, SAI_PROTOCOL_DATASIZE_16BIT, 2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SAI1_Init 2 */
+
+  /* USER CODE END SAI1_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -214,6 +291,22 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -225,6 +318,7 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
