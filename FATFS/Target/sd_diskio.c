@@ -17,8 +17,8 @@
   */
 /* USER CODE END Header */
 
-/* Note: code generation based on sd_diskio_template_bspv1.c v2.1.4
-   as "Use dma template" is disabled. */
+/* Note: code generation based on sd_diskio_dma_rtos_template_bspv1.c v2.1.4
+   as FreeRTOS is enabled. */
 
 /* USER CODE BEGIN firstSection */
 /* can be used to modify / undefine following code or add new definitions */
@@ -28,16 +28,34 @@
 #include "ff_gen_drv.h"
 #include "sd_diskio.h"
 
+#include <string.h>
+#include <stdio.h>
+
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
-/* use the default SD timout as defined in the platform BSP driver*/
-#if defined(SDMMC_DATATIMEOUT)
-#define SD_TIMEOUT SDMMC_DATATIMEOUT
-#elif defined(SD_DATATIMEOUT)
-#define SD_TIMEOUT SD_DATATIMEOUT
-#else
+
+#define QUEUE_SIZE         (uint32_t) 10
+#define READ_CPLT_MSG      (uint32_t) 1
+#define WRITE_CPLT_MSG     (uint32_t) 2
+#define RW_ABORT_MSG       (uint32_t) 4
+/*
+==================================================================
+enable the defines below to send custom rtos messages
+when an error or an abort occurs.
+Notice: depending on the HAL/SD driver the HAL_SD_ErrorCallback()
+may not be available.
+See BSP_SD_ErrorCallback() and BSP_SD_AbortCallback() below
+==================================================================
+
+#define RW_ERROR_MSG       (uint32_t) 3
+#define RW_ABORT_MSG       (uint32_t) 4
+*/
+/*
+ * the following Timeout is useful to give the control back to the applications
+ * in case of errors in either BSP_SD_ReadCpltCallback() or BSP_SD_WriteCpltCallback()
+ * the value by default is as defined in the BSP platform driver otherwise 30 secs
+ */
 #define SD_TIMEOUT 30 * 1000
-#endif
 
 #define SD_DEFAULT_BLOCK_SIZE 512
 
@@ -51,10 +69,41 @@
 #define DISABLE_SD_INIT
 /* USER CODE END disableSDInit */
 
+/*
+ * when using cacheable memory region, it may be needed to maintain the cache
+ * validity. Enable the define below to activate a cache maintenance at each
+ * read and write operation.
+ * Notice: This is applicable only for cortex M7 based platform.
+ */
+/* USER CODE BEGIN enableSDDmaCacheMaintenance */
+/* #define ENABLE_SD_DMA_CACHE_MAINTENANCE  1 */
+/* USER CODE END enableSDDmaCacheMaintenance */
+
+/*
+* Some DMA requires 4-Byte aligned address buffer to correctly read/write data,
+* in FatFs some accesses aren't thus we need a 4-byte aligned scratch buffer to correctly
+* transfer data
+*/
+/* USER CODE BEGIN enableScratchBuffer */
+/* #define ENABLE_SCRATCH_BUFFER */
+/* USER CODE END enableScratchBuffer */
+
 /* Private variables ---------------------------------------------------------*/
+#if defined(ENABLE_SCRATCH_BUFFER)
+#if defined (ENABLE_SD_DMA_CACHE_MAINTENANCE)
+ALIGN_32BYTES(static uint8_t scratch[BLOCKSIZE]); // 32-Byte aligned for cache maintenance
+#else
+__ALIGN_BEGIN static uint8_t scratch[BLOCKSIZE] __ALIGN_END;
+#endif
+#endif
 /* Disk status */
 static volatile DSTATUS Stat = STA_NOINIT;
 
+#if (osCMSIS <= 0x20000U)
+static osMessageQId SDQueueID = NULL;
+#else
+static osMessageQueueId_t SDQueueID = NULL;
+#endif
 /* Private function prototypes -----------------------------------------------*/
 static DSTATUS SD_CheckStatus(BYTE lun);
 DSTATUS SD_initialize (BYTE);
@@ -87,11 +136,32 @@ const Diskio_drvTypeDef  SD_Driver =
 
 /* Private functions ---------------------------------------------------------*/
 
+static int SD_CheckStatusWithTimeout(uint32_t timeout)
+{
+  uint32_t timer;
+  /* block until SDIO peripheral is ready again or a timeout occur */
+#if (osCMSIS <= 0x20000U)
+  timer = osKernelSysTick();
+  while( osKernelSysTick() - timer < timeout)
+#else
+  timer = osKernelGetTickCount();
+  while( osKernelGetTickCount() - timer < timeout)
+#endif
+  {
+    if (BSP_SD_GetCardState() == SD_TRANSFER_OK)
+    {
+      return 0;
+    }
+  }
+
+  return -1;
+}
+
 static DSTATUS SD_CheckStatus(BYTE lun)
 {
   Stat = STA_NOINIT;
 
-  if(BSP_SD_GetCardState() == MSD_OK)
+  if(BSP_SD_GetCardState() == SD_TRANSFER_OK)
   {
     Stat &= ~STA_NOINIT;
   }
@@ -108,16 +178,50 @@ DSTATUS SD_initialize(BYTE lun)
 {
 Stat = STA_NOINIT;
 
+  /*
+   * check that the kernel has been started before continuing
+   * as the osMessage API will fail otherwise
+   */
+#if (osCMSIS <= 0x20000U)
+  if(osKernelRunning())
+#else
+  if(osKernelGetState() == osKernelRunning)
+#endif
+  {
 #if !defined(DISABLE_SD_INIT)
 
-  if(BSP_SD_Init() == MSD_OK)
-  {
-    Stat = SD_CheckStatus(lun);
-  }
+    if(BSP_SD_Init() == MSD_OK)
+    {
+      Stat = SD_CheckStatus(lun);
+    }
 
 #else
-  Stat = SD_CheckStatus(lun);
+    Stat = SD_CheckStatus(lun);
 #endif
+
+    /*
+    * if the SD is correctly initialized, create the operation queue
+    * if not already created
+    */
+
+    if (Stat != STA_NOINIT)
+    {
+      if (SDQueueID == NULL)
+      {
+ #if (osCMSIS <= 0x20000U)
+      osMessageQDef(SD_Queue, QUEUE_SIZE, uint16_t);
+      SDQueueID = osMessageCreate (osMessageQ(SD_Queue), NULL);
+#else
+      SDQueueID = osMessageQueueNew(QUEUE_SIZE, 2, NULL);
+#endif
+      }
+
+      if (SDQueueID == NULL)
+      {
+        Stat |= STA_NOINIT;
+      }
+    }
+  }
 
   return Stat;
 }
@@ -146,17 +250,55 @@ DSTATUS SD_status(BYTE lun)
 
 DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 {
+  uint8_t ret;
   DRESULT res = RES_ERROR;
+  uint32_t timer;
+#if (osCMSIS < 0x20000U)
+  osEvent event;
+#else
+  uint16_t event;
+  osStatus_t status;
+#endif
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+  uint32_t alignedAddr;
+#endif
 
-  if(BSP_SD_ReadBlocks((uint32_t*)buff,
-                       (uint32_t) (sector),
-                       count, SD_TIMEOUT) == MSD_OK)
+  if (SD_CheckStatusWithTimeout(SD_TIMEOUT) < 0)
   {
-    /* wait until the read operation is finished */
-    while(BSP_SD_GetCardState()!= MSD_OK)
+    return res;
+  }
+
+  ret = BSP_SD_ReadBlocks_DMA((uint32_t*)buff, (uint32_t)sector, count);
+  if (ret == MSD_OK)
+  {
+#if (osCMSIS < 0x20000U)
+    event = osMessageGet(SDQueueID, SD_TIMEOUT);
+    if ((event.status == osEventMessage) && (event.value.v == READ_CPLT_MSG))
+#else
+    status = osMessageQueueGet(SDQueueID, (void *)&event, NULL, SD_TIMEOUT);
+    if ((status == osOK) && (event == READ_CPLT_MSG))
+#endif
     {
+#if (osCMSIS < 0x20000U)
+      timer = osKernelSysTick();
+      while (osKernelSysTick() - timer < SD_TIMEOUT)
+#else
+      timer = osKernelGetTickCount();
+      while (osKernelGetTickCount() - timer < SD_TIMEOUT)
+#endif
+      {
+        if (BSP_SD_GetCardState() == SD_TRANSFER_OK)
+        {
+          res = RES_OK;
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+          alignedAddr = (uint32_t)buff & ~0x1F;
+          SCB_InvalidateDCache_by_Addr((uint32_t*)alignedAddr,
+                                       count * BLOCKSIZE + ((uint32_t)buff - alignedAddr));
+#endif
+          break;
+        }
+      }
     }
-    res = RES_OK;
   }
 
   return res;
@@ -178,16 +320,53 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 {
   DRESULT res = RES_ERROR;
+  uint32_t timer;
+#if (osCMSIS < 0x20000U)
+  osEvent event;
+#else
+  uint16_t event;
+  osStatus_t status;
+#endif
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+  uint32_t alignedAddr;
+#endif
 
-  if(BSP_SD_WriteBlocks((uint32_t*)buff,
-                        (uint32_t)(sector),
-                        count, SD_TIMEOUT) == MSD_OK)
+  if (SD_CheckStatusWithTimeout(SD_TIMEOUT) < 0)
   {
-	/* wait until the Write operation is finished */
-    while(BSP_SD_GetCardState() != MSD_OK)
+    return res;
+  }
+
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+  alignedAddr = (uint32_t)buff & ~0x1F;
+  SCB_CleanDCache_by_Addr((uint32_t*)alignedAddr,
+                          count * BLOCKSIZE + ((uint32_t)buff - alignedAddr));
+#endif
+
+  if (BSP_SD_WriteBlocks_DMA((uint32_t*)buff, (uint32_t)sector, count) == MSD_OK)
+  {
+#if (osCMSIS < 0x20000U)
+    event = osMessageGet(SDQueueID, SD_TIMEOUT);
+    if ((event.status == osEventMessage) && (event.value.v == WRITE_CPLT_MSG))
+#else
+    status = osMessageQueueGet(SDQueueID, (void *)&event, NULL, SD_TIMEOUT);
+    if ((status == osOK) && (event == WRITE_CPLT_MSG))
+#endif
     {
+#if (osCMSIS < 0x20000U)
+      timer = osKernelSysTick();
+      while (osKernelSysTick() - timer < SD_TIMEOUT)
+#else
+      timer = osKernelGetTickCount();
+      while (osKernelGetTickCount() - timer < SD_TIMEOUT)
+#endif
+      {
+        if (BSP_SD_GetCardState() == SD_TRANSFER_OK)
+        {
+          res = RES_OK;
+          break;
+        }
+      }
     }
-    res = RES_OK;
   }
 
   return res;
@@ -251,6 +430,66 @@ DRESULT SD_ioctl(BYTE lun, BYTE cmd, void *buff)
 /* USER CODE BEGIN afterIoctlSection */
 /* can be used to modify previous code / undefine following code / add new code */
 /* USER CODE END afterIoctlSection */
+
+/* USER CODE BEGIN callbackSection */
+/* can be used to modify / following code or add new code */
+/* USER CODE END callbackSection */
+/**
+  * @brief Tx Transfer completed callbacks
+  * @param hsd: SD handle
+  * @retval None
+  */
+void BSP_SD_WriteCpltCallback(void)
+{
+
+  /*
+   * No need to add an "osKernelRunning()" check here, as the SD_initialize()
+   * is always called before any SD_Read()/SD_Write() call
+   */
+#if (osCMSIS < 0x20000U)
+   osMessagePut(SDQueueID, WRITE_CPLT_MSG, 0);
+#else
+   const uint16_t msg = WRITE_CPLT_MSG;
+   osMessageQueuePut(SDQueueID, (const void *)&msg, 0, 0);
+#endif
+}
+
+/**
+  * @brief Rx Transfer completed callbacks
+  * @param hsd: SD handle
+  * @retval None
+  */
+void BSP_SD_ReadCpltCallback(void)
+{
+  /*
+   * No need to add an "osKernelRunning()" check here, as the SD_initialize()
+   * is always called before any SD_Read()/SD_Write() call
+   */
+#if (osCMSIS < 0x20000U)
+   osMessagePut(SDQueueID, READ_CPLT_MSG, 0);
+#else
+   const uint16_t msg = READ_CPLT_MSG;
+   osMessageQueuePut(SDQueueID, (const void *)&msg, 0, 0);
+#endif
+}
+
+/* USER CODE BEGIN ErrorAbortCallbacks */
+void BSP_SD_AbortCallback(void)
+{
+#if (osCMSIS < 0x20000U)
+   if (SDQueueID != NULL)
+   {
+     osMessagePut(SDQueueID, RW_ABORT_MSG, 0);
+   }
+#else
+   if (SDQueueID != NULL)
+   {
+     const uint16_t msg = RW_ABORT_MSG;
+     osMessageQueuePut(SDQueueID, (const void *)&msg, 0, 0);
+   }
+#endif
+}
+/* USER CODE END ErrorAbortCallbacks */
 
 /* USER CODE BEGIN lastSection */
 /* can be used to modify / undefine previous code or add new code */

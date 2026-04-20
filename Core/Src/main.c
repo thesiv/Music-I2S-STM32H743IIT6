@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 #include "fatfs.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -39,6 +40,17 @@ typedef struct
     DWORD dataSize;
 } WavInfo;
 
+enum
+{
+    LOG_QUEUE_DEPTH = 24U,
+    LOG_MESSAGE_MAX_LEN = 192U
+};
+
+typedef struct
+{
+    char text[LOG_MESSAGE_MAX_LEN];
+} LogMessage;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -48,7 +60,11 @@ typedef struct
 #define AUDIO_SAMPLES    (AUDIO_FRAMES * AUDIO_CHANNELS)
 #define AUDIO_HALF_FRAMES  (AUDIO_FRAMES / 2)
 #define AUDIO_HALF_SAMPLES (AUDIO_SAMPLES / 2)
-#define WAV_FILE_NAME    "collectathon.wav"
+#define WAV_FILE_NAME    "collectathon_48k.wav"
+#define AUDIO_EVT_HALF     (1UL << 0)
+#define AUDIO_EVT_COMPLETE (1UL << 1)
+#define AUDIO_DMA_ACCESSIBLE __attribute__((section(".RAM_D2"), aligned(32)))
+#define SD_DMA_ACCESSIBLE __attribute__((section(".RAM_D1"), aligned(32)))
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -65,22 +81,59 @@ SD_HandleTypeDef hsd1;
 
 UART_HandleTypeDef huart1;
 
+/* Definitions for audioTask */
+osThreadId_t audioTaskHandle;
+const osThreadAttr_t audioTask_attributes = {
+  .name = "audioTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+/* Definitions for storageTask */
+osThreadId_t storageTaskHandle;
+const osThreadAttr_t storageTask_attributes = {
+  .name = "storageTask",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for uiTask */
+osThreadId_t uiTaskHandle;
+const osThreadAttr_t uiTask_attributes = {
+  .name = "uiTask",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for inputTask */
+osThreadId_t inputTaskHandle;
+const osThreadAttr_t inputTask_attributes = {
+  .name = "inputTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityBelowNormal,
+};
+/* Definitions for logTask */
+osThreadId_t logTaskHandle;
+const osThreadAttr_t logTask_attributes = {
+  .name = "logTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
 /* USER CODE BEGIN PV */
-__attribute__((section(".RAM_D2"), aligned(32)))
+AUDIO_DMA_ACCESSIBLE
 static int16_t g_audioBuffer[AUDIO_SAMPLES];
 
+SD_DMA_ACCESSIBLE
 static FATFS g_fatfs;
 
+SD_DMA_ACCESSIBLE
 static FIL g_audioFile;
 static WavInfo g_wavInfo;
 static DWORD g_wavDataRemaining;
+SD_DMA_ACCESSIBLE
 static uint8_t g_wavReadBuf[1024];
 static uint16_t g_volumeQ15 = 983U;
-static volatile uint8_t g_fillFirstHalf;
-static volatile uint8_t g_fillSecondHalf;
 static uint8_t g_audioFileOpen;
 static uint8_t g_playbackStarted;
 static uint8_t g_playbackEofPrinted;
+static osMessageQueueId_t g_logQueueHandle;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -91,15 +144,44 @@ static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_SAI1_Init(void);
 static void MX_SDMMC1_SD_Init(void);
+void StartAudioTask(void *argument);
+void StartStorageTask(void *argument);
+void StartUiTask(void *argument);
+void StartInputTask(void *argument);
+void StartLogTask(void *argument);
+
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void UartWriteBlocking(const char* text)
+{
+    if (text == NULL)
+    {
+        return;
+    }
+
+    HAL_UART_Transmit(&huart1, (uint8_t*)text, (uint16_t)strlen(text), HAL_MAX_DELAY);
+}
+
 static void UartPrint(const char* text)
 {
-    HAL_UART_Transmit(&huart1, (uint8_t*)text, (uint16_t)strlen(text), HAL_MAX_DELAY);
+    if (text == NULL)
+    {
+        return;
+    }
+
+    if (g_logQueueHandle != NULL && osKernelGetState() == osKernelRunning)
+    {
+        LogMessage msg;
+        snprintf(msg.text, sizeof(msg.text), "%s", text);
+        (void)osMessageQueuePut(g_logQueueHandle, &msg, 0U, 0U);
+        return;
+    }
+
+    UartWriteBlocking(text);
 }
 
 static void UartPrintFResult(const char* prefix, FRESULT fr)
@@ -333,14 +415,12 @@ static FRESULT ParseWavHeader(FIL* file, WavInfo* info)
 static HAL_StatusTypeDef ConfigureSaiForWav(const WavInfo* info)
 {
     uint32_t saiFrequency = WavSampleRateToSaiFrequency(info->sampleRate);
-    if (saiFrequency == 0U)
+    if (saiFrequency == 0U || saiFrequency != hsai_BlockA1.Init.AudioFrequency)
     {
         return HAL_ERROR;
     }
 
-    hsai_BlockA1.Init.AudioFrequency = saiFrequency;
-    hsai_BlockA1.Init.MonoStereoMode = SAI_STEREOMODE;
-    return HAL_SAI_InitProtocol(&hsai_BlockA1, SAI_I2S_STANDARD, SAI_PROTOCOL_DATASIZE_16BIT, AUDIO_CHANNELS);
+    return HAL_OK;
 }
 
 static void FillAudioBufferHalf(uint32_t halfIndex)
@@ -409,17 +489,15 @@ static void FillAudioBufferHalf(uint32_t halfIndex)
     }
 }
 
-static void ProcessAudioPlayback(void)
+static void ProcessAudioPlayback(uint32_t events)
 {
-    if (g_fillFirstHalf)
+    if ((events & AUDIO_EVT_HALF) != 0U)
     {
-        g_fillFirstHalf = 0;
         FillAudioBufferHalf(0);
     }
 
-    if (g_fillSecondHalf)
+    if ((events & AUDIO_EVT_COMPLETE) != 0U)
     {
-        g_fillSecondHalf = 0;
         FillAudioBufferHalf(1);
     }
 
@@ -487,8 +565,6 @@ static void StartWavPlayback(void)
 
     g_wavDataRemaining = g_wavInfo.dataSize;
     g_playbackEofPrinted = 0;
-    g_fillFirstHalf = 0;
-    g_fillSecondHalf = 0;
 
     FillAudioBufferHalf(0);
     FillAudioBufferHalf(1);
@@ -548,10 +624,55 @@ int main(void)
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
 
-  HAL_UART_Transmit(&huart1, (uint8_t *)"Hello World!\r\n", 14, HAL_MAX_DELAY);
-
-  StartWavPlayback();
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  g_logQueueHandle = osMessageQueueNew(LOG_QUEUE_DEPTH, sizeof(LogMessage), NULL);
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of audioTask */
+  audioTaskHandle = osThreadNew(StartAudioTask, NULL, &audioTask_attributes);
+
+  /* creation of storageTask */
+  storageTaskHandle = osThreadNew(StartStorageTask, NULL, &storageTask_attributes);
+
+  /* creation of uiTask */
+  uiTaskHandle = osThreadNew(StartUiTask, NULL, &uiTask_attributes);
+
+  /* creation of inputTask */
+  inputTaskHandle = osThreadNew(StartInputTask, NULL, &inputTask_attributes);
+
+  /* creation of logTask */
+  logTaskHandle = osThreadNew(StartLogTask, NULL, &logTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -560,7 +681,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    ProcessAudioPlayback();
   }
   /* USER CODE END 3 */
 }
@@ -662,7 +782,6 @@ static void MX_SAI1_Init(void)
   // FIX:
   // hsai_BlockA1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
   // hsai_BlockA1.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
-
   /* USER CODE END SAI1_Init 0 */
 
   /* USER CODE BEGIN SAI1_Init 1 */
@@ -708,7 +827,7 @@ static void MX_SDMMC1_SD_Init(void)
   hsd1.Instance = SDMMC1;
   hsd1.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
   hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
-  hsd1.Init.BusWide = SDMMC_BUS_WIDE_1B;
+  hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
   hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_ENABLE;
   hsd1.Init.ClockDiv = 8;
   if (HAL_SD_Init(&hsd1) != HAL_OK)
@@ -813,7 +932,10 @@ void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai)
 {
   if (hsai->Instance == SAI1_Block_A)
   {
-    g_fillFirstHalf = 1;
+    if (audioTaskHandle != NULL)
+    {
+      (void)osThreadFlagsSet(audioTaskHandle, AUDIO_EVT_HALF);
+    }
   }
 }
 
@@ -821,11 +943,145 @@ void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai)
 {
   if (hsai->Instance == SAI1_Block_A)
   {
-    g_fillSecondHalf = 1;
+    if (audioTaskHandle != NULL)
+    {
+      (void)osThreadFlagsSet(audioTaskHandle, AUDIO_EVT_COMPLETE);
+    }
   }
 }
 
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartAudioTask */
+/**
+  * @brief  Function implementing the audioTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartAudioTask */
+void StartAudioTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  StartWavPlayback();
+
+  for(;;)
+  {
+    uint32_t events = osThreadFlagsWait(AUDIO_EVT_HALF | AUDIO_EVT_COMPLETE,
+                                        osFlagsWaitAny,
+                                        osWaitForever);
+    if ((events & osFlagsError) == 0U)
+    {
+      ProcessAudioPlayback(events);
+    }
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartStorageTask */
+/**
+* @brief Function implementing the storageTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartStorageTask */
+void StartStorageTask(void *argument)
+{
+  /* USER CODE BEGIN StartStorageTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartStorageTask */
+}
+
+/* USER CODE BEGIN Header_StartUiTask */
+/**
+* @brief Function implementing the uiTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartUiTask */
+void StartUiTask(void *argument)
+{
+  /* USER CODE BEGIN StartUiTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartUiTask */
+}
+
+/* USER CODE BEGIN Header_StartInputTask */
+/**
+* @brief Function implementing the inputTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartInputTask */
+void StartInputTask(void *argument)
+{
+  /* USER CODE BEGIN StartInputTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartInputTask */
+}
+
+/* USER CODE BEGIN Header_StartLogTask */
+/**
+* @brief Function implementing the logTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartLogTask */
+void StartLogTask(void *argument)
+{
+  /* USER CODE BEGIN StartLogTask */
+  LogMessage msg;
+
+  UartWriteBlocking("Log task started\r\n");
+
+  for(;;)
+  {
+    if (g_logQueueHandle == NULL)
+    {
+      osDelay(100);
+      continue;
+    }
+
+    if (osMessageQueueGet(g_logQueueHandle, &msg, NULL, osWaitForever) == osOK)
+    {
+      UartWriteBlocking(msg.text);
+    }
+  }
+  /* USER CODE END StartLogTask */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.

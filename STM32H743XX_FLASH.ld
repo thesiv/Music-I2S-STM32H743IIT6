@@ -240,6 +240,14 @@ SECTIONS
     . = ALIGN(8);
   } >DTCMRAM
 
+  .RAM_D1 (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.RAM_D1)
+    *(.RAM_D1*)
+    . = ALIGN(32);
+  } >RAM
+
   .RAM_D2 (NOLOAD) :
   {
     . = ALIGN(32);
