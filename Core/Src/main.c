@@ -160,6 +160,13 @@ static void SDRAM_Initialization_Sequence(SDRAM_HandleTypeDef *hsdram);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void UserLedSet(uint8_t enabled)
+{
+    HAL_GPIO_WritePin(USER_LED_GPIO_Port,
+                      USER_LED_Pin,
+                      enabled ? GPIO_PIN_RESET : GPIO_PIN_SET);
+}
+
 static void UartWriteBlocking(const char* text)
 {
     if (text == NULL)
@@ -552,6 +559,7 @@ static void ProcessAudioPlayback(uint32_t events)
     if (g_playbackStarted && !g_audioFileOpen && !g_playbackEofPrinted)
     {
         UartPrint("WAV playback reached EOF, outputting silence\r\n");
+        UserLedSet(0U);
         g_playbackEofPrinted = 1;
     }
 }
@@ -562,6 +570,7 @@ static void StartWavPlayback(void)
     char msg[160];
     char filePath[32];
 
+    UserLedSet(0U);
     UartPrint("==== WAV playback start ====\r\n");
     UartPrintSdStatus("Before f_mount");
 
@@ -629,6 +638,7 @@ static void StartWavPlayback(void)
     }
 
     g_playbackStarted = 1;
+    UserLedSet(1U);
     UartPrint("WAV playback DMA started\r\n");
 }
 /* USER CODE END 0 */
@@ -1008,6 +1018,8 @@ static void MX_FMC_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -1020,6 +1032,16 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOG_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(USER_LED_GPIO_Port, USER_LED_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin : USER_LED_Pin */
+  GPIO_InitStruct.Pin = USER_LED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(USER_LED_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
