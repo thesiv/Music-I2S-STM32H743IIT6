@@ -24,6 +24,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ff.h"
+#include "lcd.h"
+#include "touch.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -74,8 +76,8 @@ typedef struct
 
 /* Private variables ---------------------------------------------------------*/
 
-SAI_HandleTypeDef hsai_BlockA1;
-DMA_HandleTypeDef hdma_sai1_a;
+I2S_HandleTypeDef hi2s3;
+DMA_HandleTypeDef hdma_spi3_tx;
 
 SD_HandleTypeDef hsd1;
 
@@ -131,11 +133,13 @@ static WavInfo g_wavInfo;
 static DWORD g_wavDataRemaining;
 SD_DMA_ACCESSIBLE
 static uint8_t g_wavReadBuf[1024];
-static uint16_t g_volumeQ15 = 983U;
+static uint16_t g_volumeQ15 = 5983U;
 static uint8_t g_audioFileOpen;
 static uint8_t g_playbackStarted;
 static uint8_t g_playbackEofPrinted;
 static osMessageQueueId_t g_logQueueHandle;
+static uint8_t g_lcdReady;
+static uint8_t g_touchReady;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -145,7 +149,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_FMC_Init(void);
 static void MX_USART1_UART_Init(void);
-static void MX_SAI1_Init(void);
+static void MX_I2S3_Init(void);
 static void MX_SDMMC1_SD_Init(void);
 void StartAudioTask(void *argument);
 void StartStorageTask(void *argument);
@@ -342,28 +346,28 @@ static FRESULT SkipChunkPayload(FIL* file, DWORD chunkSize)
     return f_lseek(file, f_tell(file) + skipSize);
 }
 
-static uint32_t WavSampleRateToSaiFrequency(uint32_t sampleRate)
+static uint32_t WavSampleRateToI2sFrequency(uint32_t sampleRate)
 {
     switch (sampleRate)
     {
     case 8000U:
-        return SAI_AUDIO_FREQUENCY_8K;
+        return I2S_AUDIOFREQ_8K;
     case 11025U:
-        return SAI_AUDIO_FREQUENCY_11K;
+        return I2S_AUDIOFREQ_11K;
     case 16000U:
-        return SAI_AUDIO_FREQUENCY_16K;
+        return I2S_AUDIOFREQ_16K;
     case 22050U:
-        return SAI_AUDIO_FREQUENCY_22K;
+        return I2S_AUDIOFREQ_22K;
     case 32000U:
-        return SAI_AUDIO_FREQUENCY_32K;
+        return I2S_AUDIOFREQ_32K;
     case 44100U:
-        return SAI_AUDIO_FREQUENCY_44K;
+        return I2S_AUDIOFREQ_44K;
     case 48000U:
-        return SAI_AUDIO_FREQUENCY_48K;
+        return I2S_AUDIOFREQ_48K;
     case 96000U:
-        return SAI_AUDIO_FREQUENCY_96K;
+        return I2S_AUDIOFREQ_96K;
     case 192000U:
-        return SAI_AUDIO_FREQUENCY_192K;
+        return I2S_AUDIOFREQ_192K;
     default:
         return 0U;
     }
@@ -467,10 +471,10 @@ static FRESULT ParseWavHeader(FIL* file, WavInfo* info)
     return FR_OK;
 }
 
-static HAL_StatusTypeDef ConfigureSaiForWav(const WavInfo* info)
+static HAL_StatusTypeDef ConfigureI2sForWav(const WavInfo* info)
 {
-    uint32_t saiFrequency = WavSampleRateToSaiFrequency(info->sampleRate);
-    if (saiFrequency == 0U || saiFrequency != hsai_BlockA1.Init.AudioFrequency)
+    uint32_t i2sFrequency = WavSampleRateToI2sFrequency(info->sampleRate);
+    if (i2sFrequency == 0U || i2sFrequency != hi2s3.Init.AudioFreq)
     {
         return HAL_ERROR;
     }
@@ -612,9 +616,9 @@ static void StartWavPlayback(void)
              (unsigned long)g_wavInfo.dataSize);
     UartPrint(msg);
 
-    if (ConfigureSaiForWav(&g_wavInfo) != HAL_OK)
+    if (ConfigureI2sForWav(&g_wavInfo) != HAL_OK)
     {
-        UartPrint("Unsupported WAV sample rate for SAI\r\n");
+        UartPrint("Unsupported WAV sample rate for I2S3\r\n");
         f_close(&g_audioFile);
         g_audioFileOpen = 0;
         return;
@@ -626,9 +630,9 @@ static void StartWavPlayback(void)
     FillAudioBufferHalf(0);
     FillAudioBufferHalf(1);
 
-    if (HAL_SAI_Transmit_DMA(&hsai_BlockA1, (uint8_t*)g_audioBuffer, AUDIO_SAMPLES) != HAL_OK)
+    if (HAL_I2S_Transmit_DMA(&hi2s3, (uint16_t*)g_audioBuffer, AUDIO_SAMPLES) != HAL_OK)
     {
-        UartPrint("HAL_SAI_Transmit_DMA failed\r\n");
+        UartPrint("HAL_I2S_Transmit_DMA failed\r\n");
         if (g_audioFileOpen)
         {
             f_close(&g_audioFile);
@@ -678,10 +682,40 @@ int main(void)
   MX_DMA_Init();
   MX_FMC_Init();
   MX_USART1_UART_Init();
-  MX_SAI1_Init();
+  MX_I2S3_Init();
   MX_SDMMC1_SD_Init();
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
+  if (LCD_Init() == HAL_OK)
+  {
+    char lcdMsg[64];
+
+    g_lcdReady = 1U;
+    LCD_Fill(LCD_COLOR_WHITE);
+
+    LCD_DrawFilledRect(240U, 80U, 320U, 320U, LCD_COLOR_WHITE);
+    LCD_DrawFilledRect(300U, 140U, 200U, 200U, LCD_COLOR_BLUE);
+    snprintf(lcdMsg, sizeof(lcdMsg), "LCD center pixel=0x%04X\r\n", LCD_ReadPixel(400U, 240U));
+    UartPrint(lcdMsg);
+    UartPrint("LCD BL test: PH6/LCD0BL high\r\n");
+    LCD_BacklightSelfTest();
+    UartPrint(LCD_BacklightRead() == GPIO_PIN_RESET ? "LCD BL PH6/LCD0BL=LOW\r\n" : "LCD BL PH6/LCD0BL=HIGH\r\n");
+    UartPrint("LCD 800x480 initialized\r\n");
+  }
+  else
+  {
+    UartPrint("LCD init failed\r\n");
+  }
+
+  if (Touch_Init() == HAL_OK)
+  {
+    g_touchReady = 1U;
+    UartPrint("Touch controller initialized\r\n");
+  }
+  else
+  {
+    UartPrint("Touch controller not found\r\n");
+  }
 
   /* USER CODE END 2 */
 
@@ -812,7 +846,7 @@ void PeriphCommonClock_Config(void)
 
   /** Initializes the peripherals clock
   */
-  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_SDMMC|RCC_PERIPHCLK_SAI1;
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_SDMMC|RCC_PERIPHCLK_SPI123;
   PeriphClkInitStruct.PLL2.PLL2M = 25;
   PeriphClkInitStruct.PLL2.PLL2N = 393;
   PeriphClkInitStruct.PLL2.PLL2P = 32;
@@ -822,7 +856,7 @@ void PeriphCommonClock_Config(void)
   PeriphClkInitStruct.PLL2.PLL2VCOSEL = RCC_PLL2VCOWIDE;
   PeriphClkInitStruct.PLL2.PLL2FRACN = 0;
   PeriphClkInitStruct.SdmmcClockSelection = RCC_SDMMCCLKSOURCE_PLL2;
-  PeriphClkInitStruct.Sai1ClockSelection = RCC_SAI1CLKSOURCE_PLL2;
+  PeriphClkInitStruct.Spi123ClockSelection = RCC_SPI123CLKSOURCE_PLL2;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -830,41 +864,38 @@ void PeriphCommonClock_Config(void)
 }
 
 /**
-  * @brief SAI1 Initialization Function
+  * @brief I2S3 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_SAI1_Init(void)
+static void MX_I2S3_Init(void)
 {
 
-  /* USER CODE BEGIN SAI1_Init 0 */
-  // FIX:
-  // hsai_BlockA1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
-  // hsai_BlockA1.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
-  /* USER CODE END SAI1_Init 0 */
+  /* USER CODE BEGIN I2S3_Init 0 */
 
-  /* USER CODE BEGIN SAI1_Init 1 */
+  /* USER CODE END I2S3_Init 0 */
 
-  /* USER CODE END SAI1_Init 1 */
-  hsai_BlockA1.Instance = SAI1_Block_A;
-  hsai_BlockA1.Init.AudioMode = SAI_MODEMASTER_TX;
-  hsai_BlockA1.Init.Synchro = SAI_ASYNCHRONOUS;
-  hsai_BlockA1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
-  hsai_BlockA1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
-  hsai_BlockA1.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
-  hsai_BlockA1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
-  hsai_BlockA1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_48K;
-  hsai_BlockA1.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
-  hsai_BlockA1.Init.MonoStereoMode = SAI_STEREOMODE;
-  hsai_BlockA1.Init.CompandingMode = SAI_NOCOMPANDING;
-  hsai_BlockA1.Init.TriState = SAI_OUTPUT_NOTRELEASED;
-  if (HAL_SAI_InitProtocol(&hsai_BlockA1, SAI_I2S_STANDARD, SAI_PROTOCOL_DATASIZE_16BIT, 2) != HAL_OK)
+  /* USER CODE BEGIN I2S3_Init 1 */
+
+  /* USER CODE END I2S3_Init 1 */
+  hi2s3.Instance = SPI3;
+  hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
+  hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
+  hi2s3.Init.DataFormat = I2S_DATAFORMAT_16B;
+  hi2s3.Init.MCLKOutput = I2S_MCLKOUTPUT_DISABLE;
+  hi2s3.Init.AudioFreq = I2S_AUDIOFREQ_48K;
+  hi2s3.Init.CPOL = I2S_CPOL_LOW;
+  hi2s3.Init.FirstBit = I2S_FIRSTBIT_MSB;
+  hi2s3.Init.WSInversion = I2S_WS_INVERSION_DISABLE;
+  hi2s3.Init.Data24BitAlignment = I2S_DATA_24BIT_ALIGNMENT_RIGHT;
+  hi2s3.Init.MasterKeepIOState = I2S_MASTER_KEEP_IO_STATE_DISABLE;
+  if (HAL_I2S_Init(&hi2s3) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN SAI1_Init 2 */
+  /* USER CODE BEGIN I2S3_Init 2 */
 
-  /* USER CODE END SAI1_Init 2 */
+  /* USER CODE END I2S3_Init 2 */
 
 }
 
@@ -1126,10 +1157,20 @@ void StartStorageTask(void *argument)
 void StartUiTask(void *argument)
 {
   /* USER CODE BEGIN StartUiTask */
-  /* Infinite loop */
+  LCD_DrawFilledRect(0, 0, 10U, 1U, LCD_COLOR_WHITE);
   for(;;)
   {
-    osDelay(1);
+    /*if (g_lcdReady && g_touchReady && Touch_Read(&touch) == HAL_OK && touch.pressed)
+    {
+      uint16_t x = (touch.x < LCD_WIDTH) ? touch.x : (LCD_WIDTH - 1U);
+      uint16_t y = (touch.y < LCD_HEIGHT) ? touch.y : (LCD_HEIGHT - 1U);
+      uint16_t rx = (x > 8U) ? (uint16_t)(x - 8U) : 0U;
+      uint16_t ry = (y > 8U) ? (uint16_t)(y - 8U) : 0U;
+      LCD_DrawFilledRect(rx, ry, 17U, 17U, LCD_COLOR_WHITE);
+      LCD_DrawFilledRect(x, ry, 1U, 17U, LCD_COLOR_BLACK);
+      LCD_DrawFilledRect(rx, y, 17U, 1U, LCD_COLOR_BLACK);
+    }*/
+    osDelay(20);
   }
   /* USER CODE END StartUiTask */
 }
