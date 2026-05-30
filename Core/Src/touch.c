@@ -13,7 +13,8 @@
 #define GT9XX_ADDR_14       0x14U
 #define GT9XX_REG_PRODUCT   0x8140U
 #define GT9XX_REG_STATUS    0x814EU
-#define GT9XX_REG_POINT1    0x8150U
+#define GT9XX_REG_POINTS    0x814FU
+#define GT9XX_POINT_BYTES   8U
 
 static uint8_t g_touchAddress = GT9XX_ADDR_5D;
 
@@ -258,6 +259,7 @@ static HAL_StatusTypeDef TouchProbeAddressNoReset(uint8_t address)
 HAL_StatusTypeDef Touch_Init(void)
 {
     TouchGpioInit();
+    TouchIntAsInput();
     HAL_Delay(20);
 
     if (TouchProbeAddressNoReset(GT9XX_ADDR_5D) == HAL_OK)
@@ -281,17 +283,23 @@ HAL_StatusTypeDef Touch_Init(void)
 HAL_StatusTypeDef Touch_Read(TouchState *state)
 {
     uint8_t status = 0;
-    uint8_t point[8] = {0};
+    uint8_t pointData[TOUCH_MAX_POINTS * GT9XX_POINT_BYTES] = {0};
     uint8_t clear = 0;
+    uint8_t count;
 
     if (state == NULL)
     {
         return HAL_ERROR;
     }
 
-    state->pressed = 0;
-    state->x = 0;
-    state->y = 0;
+    state->count = 0;
+    for (uint8_t i = 0; i < TOUCH_MAX_POINTS; ++i)
+    {
+        state->points[i].id = 0;
+        state->points[i].x = 0;
+        state->points[i].y = 0;
+        state->points[i].size = 0;
+    }
 
     if (TouchReadReg(g_touchAddress, GT9XX_REG_STATUS, &status, sizeof(status)) != HAL_OK)
     {
@@ -303,14 +311,37 @@ HAL_StatusTypeDef Touch_Read(TouchState *state)
         return HAL_OK;
     }
 
-    if ((status & 0x0FU) != 0U)
+    count = status & 0x0FU;
+    if (count > TOUCH_MAX_POINTS)
     {
-        if (TouchReadReg(g_touchAddress, GT9XX_REG_POINT1, point, sizeof(point)) == HAL_OK)
-        {
-            state->pressed = 1U;
-            state->x = (uint16_t)point[1] | ((uint16_t)point[2] << 8);
-            state->y = (uint16_t)point[3] | ((uint16_t)point[4] << 8);
-        }
+        (void)TouchWriteReg(g_touchAddress, GT9XX_REG_STATUS, &clear, sizeof(clear));
+        return HAL_ERROR;
+    }
+
+    if (count == 0U)
+    {
+        (void)TouchWriteReg(g_touchAddress, GT9XX_REG_STATUS, &clear, sizeof(clear));
+        return HAL_OK;
+    }
+
+    if (TouchReadReg(g_touchAddress,
+                     GT9XX_REG_POINTS,
+                     pointData,
+                     (uint16_t)(count * GT9XX_POINT_BYTES)) != HAL_OK)
+    {
+        (void)TouchWriteReg(g_touchAddress, GT9XX_REG_STATUS, &clear, sizeof(clear));
+        return HAL_ERROR;
+    }
+
+    state->count = count;
+
+    for (uint8_t i = 0; i < count; ++i)
+    {
+        uint8_t *point = &pointData[i * GT9XX_POINT_BYTES];
+        state->points[i].id = point[0];
+        state->points[i].x = (uint16_t)point[1] | ((uint16_t)point[2] << 8);
+        state->points[i].y = (uint16_t)point[3] | ((uint16_t)point[4] << 8);
+        state->points[i].size = (uint16_t)point[5] | ((uint16_t)point[6] << 8);
     }
 
     (void)TouchWriteReg(g_touchAddress, GT9XX_REG_STATUS, &clear, sizeof(clear));

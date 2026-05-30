@@ -11,6 +11,9 @@
 #define LCD_VBP              23U
 #define LCD_VFP              22U
 
+#define LCD_BACKLIGHT_PWM_HZ 2000U
+#define LCD_BACKLIGHT_PWM_COUNTER_HZ 1000000U
+
 static const uint32_t g_framebufferTestOffsets[] = {
     0U,
     1U,
@@ -24,6 +27,78 @@ static const uint32_t g_framebufferTestOffsets[] = {
 LTDC_HandleTypeDef hltdc;
 
 static volatile uint16_t * const g_framebuffer = (volatile uint16_t *)LCD_FRAMEBUFFER_ADDR;
+static TIM_HandleTypeDef htim_lcd_backlight;
+static uint8_t g_backlightDutyPercent;
+static uint8_t g_backlightPwmReady;
+
+static uint32_t LCD_BacklightTimerClockHz(void)
+{
+    uint32_t timerClockHz = HAL_RCC_GetPCLK1Freq();
+
+    if ((RCC->D2CFGR & RCC_D2CFGR_D2PPRE1) != RCC_D2CFGR_D2PPRE1_DIV1)
+    {
+        timerClockHz *= 2U;
+    }
+
+    return timerClockHz;
+}
+
+static HAL_StatusTypeDef LCD_BacklightPwmInit(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    TIM_OC_InitTypeDef pwm = {0};
+    uint32_t timerClockHz = LCD_BacklightTimerClockHz();
+    uint32_t prescaler = (timerClockHz / LCD_BACKLIGHT_PWM_COUNTER_HZ);
+    uint32_t period = (LCD_BACKLIGHT_PWM_COUNTER_HZ / LCD_BACKLIGHT_PWM_HZ);
+
+    if (g_backlightPwmReady)
+    {
+        return HAL_OK;
+    }
+
+    if (prescaler == 0U || period == 0U)
+    {
+        return HAL_ERROR;
+    }
+
+    __HAL_RCC_TIM12_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
+
+    htim_lcd_backlight.Instance = TIM12;
+    htim_lcd_backlight.Init.Prescaler = prescaler - 1U;
+    htim_lcd_backlight.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim_lcd_backlight.Init.Period = period - 1U;
+    htim_lcd_backlight.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim_lcd_backlight.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    if (HAL_TIM_PWM_Init(&htim_lcd_backlight) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    pwm.OCMode = TIM_OCMODE_PWM1;
+    pwm.Pulse = 0U;
+    pwm.OCPolarity = TIM_OCPOLARITY_HIGH;
+    pwm.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim_lcd_backlight, &pwm, TIM_CHANNEL_1) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    gpio.Pin = GPIO_PIN_6;
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio.Alternate = GPIO_AF2_TIM12;
+    HAL_GPIO_Init(GPIOH, &gpio);
+
+    if (HAL_TIM_PWM_Start(&htim_lcd_backlight, TIM_CHANNEL_1) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    g_backlightPwmReady = 1U;
+    return HAL_OK;
+}
 
 HAL_StatusTypeDef LCD_Init(void)
 {
@@ -95,6 +170,11 @@ HAL_StatusTypeDef LCD_Init(void)
         return HAL_ERROR;
     }
 
+    if (LCD_BacklightPwmInit() != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
     LCD_BacklightSet(1U);
 
     return HAL_OK;
@@ -107,6 +187,21 @@ void LCD_BacklightSet(uint8_t enabled)
 
 void LCD_BacklightSetDuty(uint8_t dutyPercent)
 {
+    if (dutyPercent > 100U)
+    {
+        dutyPercent = 100U;
+    }
+
+    g_backlightDutyPercent = dutyPercent;
+
+    if (g_backlightPwmReady)
+    {
+        uint32_t period = __HAL_TIM_GET_AUTORELOAD(&htim_lcd_backlight) + 1U;
+        uint32_t pulse = (period * dutyPercent) / 100U;
+        __HAL_TIM_SET_COMPARE(&htim_lcd_backlight, TIM_CHANNEL_1, pulse);
+        return;
+    }
+
     HAL_GPIO_WritePin(GPIOH, GPIO_PIN_6, dutyPercent ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
@@ -124,6 +219,11 @@ void LCD_BacklightSelfTest(void)
 GPIO_PinState LCD_BacklightRead(void)
 {
     return HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_6);
+}
+
+uint8_t LCD_BacklightGetDuty(void)
+{
+    return g_backlightDutyPercent;
 }
 
 uint8_t LCD_FramebufferTest(void)

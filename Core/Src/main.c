@@ -140,6 +140,7 @@ static uint8_t g_playbackEofPrinted;
 static osMessageQueueId_t g_logQueueHandle;
 static uint8_t g_lcdReady;
 static uint8_t g_touchReady;
+static uint8_t g_lcdBrightnessPercent = 100U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -159,6 +160,7 @@ void StartLogTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 static void SDRAM_Initialization_Sequence(SDRAM_HandleTypeDef *hsdram);
+static void DrawBrightnessBar(uint8_t percent);
 
 /* USER CODE END PFP */
 
@@ -220,6 +222,34 @@ static void UartPrintSdStatus(const char* prefix)
              (unsigned)cardState,
              (unsigned long)hsd1.ErrorCode);
     UartPrint(msg);
+}
+
+static void DrawBrightnessBar(uint8_t percent)
+{
+    const uint16_t barX = 40U;
+    const uint16_t barY = LCD_HEIGHT - 42U;
+    const uint16_t barW = LCD_WIDTH - 80U;
+    const uint16_t barH = 18U;
+    uint16_t fillW;
+
+    if (!g_lcdReady)
+    {
+        return;
+    }
+
+    if (percent > 100U)
+    {
+        percent = 100U;
+    }
+
+    fillW = (uint16_t)(((uint32_t)barW * percent) / 100U);
+
+    LCD_DrawFilledRect(barX - 2U, barY - 2U, barW + 4U, barH + 4U, LCD_COLOR_WHITE);
+    LCD_DrawFilledRect(barX, barY, barW, barH, 0x7BEFU);
+    if (fillW > 0U)
+    {
+        LCD_DrawFilledRect(barX, barY, fillW, barH, LCD_COLOR_YELLOW);
+    }
 }
 
 static void SDRAM_Initialization_Sequence(SDRAM_HandleTypeDef *hsdram)
@@ -699,6 +729,8 @@ int main(void)
     UartPrint(lcdMsg);
     UartPrint("LCD BL test: PH6/LCD0BL high\r\n");
     LCD_BacklightSelfTest();
+    LCD_BacklightSetDuty(g_lcdBrightnessPercent);
+    DrawBrightnessBar(g_lcdBrightnessPercent);
     UartPrint(LCD_BacklightRead() == GPIO_PIN_RESET ? "LCD BL PH6/LCD0BL=LOW\r\n" : "LCD BL PH6/LCD0BL=HIGH\r\n");
     UartPrint("LCD 800x480 initialized\r\n");
   }
@@ -1157,19 +1189,13 @@ void StartStorageTask(void *argument)
 void StartUiTask(void *argument)
 {
   /* USER CODE BEGIN StartUiTask */
-  LCD_DrawFilledRect(0, 0, 10U, 1U, LCD_COLOR_WHITE);
+  if (g_lcdReady)
+  {
+    DrawBrightnessBar(g_lcdBrightnessPercent);
+  }
+
   for(;;)
   {
-    /*if (g_lcdReady && g_touchReady && Touch_Read(&touch) == HAL_OK && touch.pressed)
-    {
-      uint16_t x = (touch.x < LCD_WIDTH) ? touch.x : (LCD_WIDTH - 1U);
-      uint16_t y = (touch.y < LCD_HEIGHT) ? touch.y : (LCD_HEIGHT - 1U);
-      uint16_t rx = (x > 8U) ? (uint16_t)(x - 8U) : 0U;
-      uint16_t ry = (y > 8U) ? (uint16_t)(y - 8U) : 0U;
-      LCD_DrawFilledRect(rx, ry, 17U, 17U, LCD_COLOR_WHITE);
-      LCD_DrawFilledRect(x, ry, 1U, 17U, LCD_COLOR_BLACK);
-      LCD_DrawFilledRect(rx, y, 17U, 1U, LCD_COLOR_BLACK);
-    }*/
     osDelay(20);
   }
   /* USER CODE END StartUiTask */
@@ -1185,10 +1211,56 @@ void StartUiTask(void *argument)
 void StartInputTask(void *argument)
 {
   /* USER CODE BEGIN StartInputTask */
-  /* Infinite loop */
+  const uint16_t brightnessHitY = LCD_HEIGHT - 80U;
+  TouchState touch;
+  uint8_t lastBrightness = g_lcdBrightnessPercent;
+  uint8_t brightnessDragActive = 0U;
+  uint16_t filteredX = 0U;
+
   for(;;)
   {
-    osDelay(1);
+    if (g_lcdReady && g_touchReady && Touch_Read(&touch) == HAL_OK && touch.count > 0U)
+    {
+      uint16_t x = (touch.points[0].x < LCD_WIDTH) ? touch.points[0].x : (LCD_WIDTH - 1U);
+      uint16_t y = (touch.points[0].y < LCD_HEIGHT) ? touch.points[0].y : (LCD_HEIGHT - 1U);
+
+      if (!brightnessDragActive && y >= brightnessHitY)
+      {
+        brightnessDragActive = 1U;
+        filteredX = x;
+      }
+
+      if (brightnessDragActive)
+      {
+        int16_t dx = (int16_t)x - (int16_t)filteredX;
+
+        if (dx > 3 || dx < -3)
+        {
+          filteredX = (uint16_t)(((uint32_t)filteredX * 3U + (uint32_t)x) / 4U);
+        }
+
+        {
+          uint8_t brightness = (uint8_t)(((uint32_t)filteredX * 100U) / (LCD_WIDTH - 1U));
+          uint8_t delta = (brightness > lastBrightness) ?
+                          (uint8_t)(brightness - lastBrightness) :
+                          (uint8_t)(lastBrightness - brightness);
+
+          if (delta >= 2U || brightness == 0U || brightness == 100U)
+          {
+            g_lcdBrightnessPercent = brightness;
+            lastBrightness = brightness;
+            LCD_BacklightSetDuty(brightness);
+            DrawBrightnessBar(brightness);
+          }
+        }
+      }
+    }
+    else
+    {
+      brightnessDragActive = 0U;
+    }
+
+    osDelay(20);
   }
   /* USER CODE END StartInputTask */
 }

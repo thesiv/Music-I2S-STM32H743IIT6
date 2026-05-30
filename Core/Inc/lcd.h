@@ -24,6 +24,7 @@ extern LTDC_HandleTypeDef hltdc;
 HAL_StatusTypeDef LCD_Init(void);
 void LCD_BacklightSet(uint8_t enabled);
 void LCD_BacklightSetDuty(uint8_t dutyPercent);
+uint8_t LCD_BacklightGetDuty(void);
 void LCD_BacklightSelfTest(void);
 GPIO_PinState LCD_BacklightRead(void);
 uint8_t LCD_FramebufferTest(void);
